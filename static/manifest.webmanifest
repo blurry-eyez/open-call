@@ -1,0 +1,14 @@
+{
+  "name": "Open Call",
+  "short_name": "Open Call",
+  "description": "Private video calls with a pairing code. Type the same code, join the same call.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#15111f",
+  "icons": [
+    {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}
+  ]
+}

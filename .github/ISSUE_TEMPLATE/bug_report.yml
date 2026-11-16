@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible problem with Open Call.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include API secrets, `.env` files, recordings, or personal data."
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. Start the server...\n2. Join a room...\n3. ..."
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Open Call commit or version
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment type
+      options:
+        - Local development
+        - VPS / dedicated server
+        - Cloudflare Tunnel
+        - Reverse proxy (Caddy / Nginx / other)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: turn
+    attributes:
+      label: Is Cloudflare TURN configured?
+      options:
+        - Yes
+        - No
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant redacted logs
+      description: Remove tokens, recording IDs, public IPs, names, and other private details.
