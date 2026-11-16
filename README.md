@@ -64,7 +64,8 @@ git clone https://github.com/blurry-eyez/open-call.git
 cd open-call
 ```
 
-Replace `` with the GitHub account or organization that publishes your fork.
+Replace YOUR_GITHUB_USERNAME with the GitHub
+account or organization that publishes your fork.
 
 ### 3. Configure Cloudflare
 
