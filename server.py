@@ -55,6 +55,9 @@ def _load_env(path: Path) -> None:
 
 _load_env(BASE_DIR / ".env")
 
+import config  # noqa: E402  (after .env is loaded) Google keys, admin list, call limits
+import login  # noqa: E402  Google login, accounts (user.db), sessions
+
 
 def env_int(name: str, default: int) -> int:
     try:
@@ -211,10 +214,12 @@ async def ice_servers(app: web.Application) -> dict[str, Any]:
 
 # ----------------------------------------------------------------- rooms ----
 class Peer:
-    def __init__(self, pid: str, cid: str, name: str, ws: web.WebSocketResponse):
+    def __init__(self, pid: str, cid: str, name: str, ws: web.WebSocketResponse, user: dict[str, Any]):
         self.pid = pid
         self.cid = cid
         self.name = name
+        self.pic: str = user["picture"]  # Google profile picture URL
+        self.admin: bool = user["admin"]
         self.ws: web.WebSocketResponse | None = ws
         self.mic = True
         self.cam = True
@@ -234,6 +239,7 @@ class Peer:
         return {
             "pid": self.pid,
             "name": self.name,
+            "pic": self.pic,
             "mic": self.mic,
             "cam": self.cam,
             "rec": self.rec,
@@ -247,11 +253,69 @@ class Room:
         self.code = code
         self.peers: dict[str, Peer] = {}
         self.locked = False
+        self.audio_mode = "off"  # room-wide: off | call | video (audio first)
         self.waiting: dict[str, dict] = {}  # wid -> {name, ws, fut}
+        self.admin_seen: bool | None = None  # last admin state broadcast to the room
 
 
 ROOMS: dict[str, Room] = {}
 _join_log: dict[str, deque] = defaultdict(deque)
+
+# Free time limit: every room gets FREE_CALL_MINUTES, counted only while no admin is inside.
+# Used time is kept per pairing code after the room empties, so leave/rejoin can't reset the clock.
+FREE_MS = config.FREE_CALL_MINUTES * 60_000
+USED: dict[str, list[float]] = {}  # room code -> [free ms used, last activity (epoch s)]
+
+
+def room_has_admin(room: Room | None) -> bool:
+    return bool(room) and any(p.admin for p in room.peers.values())
+
+
+def room_used_ms(code: str) -> float:
+    u = USED.get(code)
+    if u and time.time() - u[1] > config.ROOM_COOLDOWN_MINUTES * 60:  # cooldown over: fresh allowance
+        USED.pop(code, None)
+        u = None
+    return u[0] if u else 0.0
+
+
+def quota_left(room: Room) -> int | None:
+    """Seconds of free time left, or None while an admin is in the room (no limit)."""
+    return None if room_has_admin(room) else max(0, int((FREE_MS - room_used_ms(room.code)) / 1000))
+
+
+async def end_free_room(app: web.Application, room: Room) -> None:
+    log.info("free limit reached room=%s", room.code)
+    msg = {"t": "fatal", "code": "limit", "error": f"The free {config.FREE_CALL_MINUTES}-minute call limit was reached."}
+    for p in list(room.peers.values()):
+        await safe_send(p.ws, msg)
+        await remove_peer(app, room, p)
+
+
+async def quota_loop(app: web.Application) -> None:
+    last, n = time.monotonic(), 0
+    while True:
+        await asyncio.sleep(1)
+        t = time.monotonic()
+        dt, last, n = (t - last) * 1000, t, n + 1
+        for room in list(ROOMS.values()):
+            try:
+                if not room.peers:
+                    continue
+                admin = room_has_admin(room)
+                room_used_ms(room.code)  # drops a stale entry
+                u = USED.setdefault(room.code, [0.0, time.time()])
+                u[1] = time.time()
+                if not admin:
+                    u[0] += dt
+                    if u[0] >= FREE_MS:
+                        await end_free_room(app, room)
+                        continue
+                if n % 5 == 0 or admin != room.admin_seen:
+                    room.admin_seen = admin
+                    await broadcast(room, {"t": "quota", "left": quota_left(room)})
+            except Exception:
+                log.exception("quota loop")
 
 
 def norm_code(raw: Any) -> str:
@@ -422,6 +486,8 @@ async def h_subscribe(app: web.Application, room: Room, peer: Peer, m: dict) -> 
     kind = "screen" if m.get("kind") == "screen" else "cam"
     t_session = target.screen_session if kind == "screen" else target.pub_session
     t_names = target.screen_tracks if kind == "screen" else target.pub_tracks
+    if kind == "cam" and m.get("audioOnly"):  # receiver wants audio only (call-only mode / weak network): never forward video
+        t_names = [n for n in t_names if n == "audio"]
     if not t_session or not t_names:
         raise APIError("Participant is still connecting.", "not_ready")
     session = await sfu(app, "POST", "/sessions/new")
@@ -483,6 +549,11 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
         if not isinstance(hello, dict) or hello.get("t") != "hello":
             await ws.close()
             return ws
+        user = login.user_from_request(request)  # Google login cookie
+        if not user:
+            await safe_send(ws, {"t": "fatal", "code": "auth", "error": "Please log in with Google first."})
+            await ws.close()
+            return ws
         if not join_allowed(ip):
             await safe_send(ws, {"t": "fatal", "code": "rate", "error": "Too many join attempts. Wait a minute."})
             await ws.close()
@@ -493,7 +564,13 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
             await safe_send(ws, {"t": "fatal", "code": "bad_code", "error": "Pairing code must be at least 3 characters."})
             await ws.close()
             return ws
-        name = norm_name(hello.get("name"))
+        name = norm_name(hello.get("name") or user["name"])
+        if not user["admin"] and not room_has_admin(ROOMS.get(code)) and room_used_ms(code) >= FREE_MS:
+            await safe_send(ws, {"t": "fatal", "code": "limit", "error": (
+                f"This room already used its free {config.FREE_CALL_MINUTES} minutes. "
+                "Try again later, or ask an admin to join.")})
+            await ws.close()
+            return ws
         room = ROOMS.setdefault(code, Room(code))
         existing = next((p for p in room.peers.values() if p.cid == cid), None)
         resumed = existing is not None
@@ -521,14 +598,15 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
                 await safe_send(ws, {"t": "fatal", "code": "full", "error": f"This call is full ({MAX_PEERS} people)."})
                 await ws.close()
                 return ws
-            peer = Peer(secrets.token_hex(4), cid, name, ws)
+            peer = Peer(secrets.token_hex(4), cid, name, ws, user)
             room.peers[peer.pid] = peer
         log.info("join room=%s pid=%s name=%s resumed=%s (%d in room)", code, peer.pid, name, resumed, len(room.peers))
         await safe_send(ws, {
             "t": "welcome", "pid": peer.pid, "resumed": resumed,
             "peers": [p.public() for p in room.peers.values() if p is not peer],
             "turn": bool(CF_TURN_KEY_ID and CF_TURN_API_TOKEN),
-            "locked": room.locked, "waiting": waitlist(room),
+            "locked": room.locked, "waiting": waitlist(room), "mode": room.audio_mode,
+            "quota": quota_left(room),
         })
         if not resumed:
             await broadcast(room, {"t": "peer-joined", "peer": peer.public()}, exclude=peer.pid)
@@ -567,6 +645,10 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
                         if not w["fut"].done():
                             w["fut"].set_result(False)
                 await broadcast(room, {"t": "lock", "on": room.locked})
+            elif t == "mode":
+                if m.get("mode") in ("off", "call", "video") and m["mode"] != room.audio_mode:
+                    room.audio_mode = m["mode"]
+                    await broadcast(room, {"t": "mode", "mode": room.audio_mode, "by": peer.name})
             elif t == "ping":
                 await safe_send(ws, {"t": "pong", "ts": m.get("ts")})
             elif t == "leave":
@@ -607,7 +689,15 @@ async def read_json(request: web.Request) -> dict:
     return data
 
 
+def need_admin(request: web.Request) -> None:
+    """Recording is only for the admin emails in config.py."""
+    user = login.user_from_request(request)
+    if not user or not user["admin"]:
+        raise APIError("Recording is restricted.", "forbidden", 403)
+
+
 async def rec_start(request: web.Request) -> web.Response:
+    need_admin(request)
     data = await read_json(request)
     peer = find_peer(data.get("code"), str(data.get("cid", "")))
     if not peer:
@@ -637,6 +727,7 @@ def rec_row(rid: str) -> sqlite3.Row:
 
 
 async def rec_chunk(request: web.Request) -> web.Response:
+    need_admin(request)
     row = rec_row(request.match_info["id"])
     if row["ended_ms"]:
         raise APIError("Recording already finished.", "closed", 409)
@@ -659,6 +750,7 @@ async def rec_chunk(request: web.Request) -> web.Response:
 
 
 async def rec_stop(request: web.Request) -> web.Response:
+    need_admin(request)
     row = rec_row(request.match_info["id"])
     with db() as c:
         c.execute("UPDATE recordings SET ended_ms=? WHERE id=? AND ended_ms IS NULL", (now_ms(), row["id"]))
@@ -667,7 +759,8 @@ async def rec_stop(request: web.Request) -> web.Response:
 
 
 async def rec_list(request: web.Request) -> web.Response:
-    code = norm_code(request.query.get("code"))
+    need_admin(request)
+    code =norm_code(request.query.get("code"))
     if not find_peer(code, request.query.get("cid", "")):
         raise APIError("Join the call first.", "forbidden", 403)
     with db() as c:
@@ -678,6 +771,7 @@ async def rec_list(request: web.Request) -> web.Response:
 
 
 async def rec_download(request: web.Request) -> web.StreamResponse:
+    need_admin(request)
     row = rec_row(request.match_info["id"])
     path = REC_DIR / row["filename"]
     if not path.is_file():
@@ -729,7 +823,7 @@ async def favicon(request: web.Request) -> web.StreamResponse:
 
 async def robots(request: web.Request) -> web.Response:
     # Only the landing page is public; the API, recordings and websocket are not for crawlers.
-    body = f"User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /rec/\nDisallow: /ws\n\nSitemap: {origin(request)}/sitemap.xml\n"
+    body = f"User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /auth/\nDisallow: /rec/\nDisallow: /ws\n\nSitemap: {origin(request)}/sitemap.xml\n"
     return web.Response(text=body, content_type="text/plain")
 
 
@@ -740,6 +834,8 @@ async def sitemap(request: web.Request) -> web.Response:
 
 
 async def api_ice(request: web.Request) -> web.Response:
+    if not login.user_from_request(request):
+        raise APIError("Please log in with Google first.", "auth", 401)
     return web.json_response(await ice_servers(request.app), headers={"Cache-Control": "no-store"})
 
 
@@ -752,9 +848,11 @@ async def health(request: web.Request) -> web.Response:
 
 async def on_startup(app: web.Application) -> None:
     app["http"] = aiohttp.ClientSession()
+    app["quota"] = asyncio.create_task(quota_loop(app))
 
 
 async def on_cleanup(app: web.Application) -> None:
+    app["quota"].cancel()
     await app["http"].close()
 
 
@@ -773,6 +871,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/recordings", rec_list)
     app.router.add_get("/rec/{id}", rec_download)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
+    login.setup(app, origin, log)  # /auth/google, /api/me, /api/signup, /api/logout + user.db
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
@@ -784,6 +883,14 @@ def main() -> None:
     print(f"  database   {DB_PATH}")
     print(f"  recordings {REC_DIR}")
     print(f"  log        {LOG_DIR / 'server.log'}")
+    print(f"  users      {login.USER_DB}")
+    if not (config.GOOGLE_CLIENT_ID and config.GOOGLE_CLIENT_SECRET):
+        print("WARNING: Google keys not set in config.py - nobody can log in.")
+    else:
+        print(f"  Google redirect URI to allow: {login.redirect_uri()}")
+        print(f"  Google JavaScript origin:     {config.PUBLIC_URL or 'https://YOUR-DOMAIN'}")
+    if not config.ADMIN_EMAILS:
+        print("NOTE: ADMIN_EMAILS is empty in config.py - nobody can record and every call is limited.")
     if not (CF_APP_ID and CF_APP_SECRET):
         print("WARNING: CF_REALTIME_APP_ID / CF_REALTIME_APP_SECRET not set - calls cannot start.")
     if not (CF_TURN_KEY_ID and CF_TURN_API_TOKEN):
