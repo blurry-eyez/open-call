@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB" alt="Python 3.10 or newer">
     <img src="https://img.shields.io/badge/WebRTC-Cloudflare%20Realtime-F38020" alt="Cloudflare Realtime">
   </p>
-  <p><a href="https://call.2105s.xyz">Live demo</a> · <a href="docs/SETUP.md">Setup guide</a> · <a href="docs/DEPLOYMENT.md">Deployment guide</a> · <a href="docs/ARCHITECTURE.md">Architecture</a></p>
+  <p><a href="https://call.2105s.xyz">Live demo</a> · <a href="docs/SETUP.md">Setup guide</a> · <a href="docs/DEPLOYMENT.md">Deployment guide</a> · <a href="docs/ARCHITECTURE.md">Architecture</a> · <a href="android-build/README.md">Android app</a></p>
 </div>
 
 Open Call is a small, self-hostable video calling application. Participants enter the same pairing code, allow camera and microphone access, and join the same room. There is no account system or third-party meeting UI SDK.
@@ -28,6 +28,7 @@ The project is intentionally split between a lightweight Python signaling server
 - Browser-side composite call recording, uploaded in chunks to the server.
 - Reconnect grace period, basic join rate limiting, and a health endpoint.
 - Responsive single-page interface and installable web-app assets.
+- Native Android app that can also share the phone's own sound (games, videos, music) while screen sharing. See [Android app](#android-app).
 
 ## How it works
 
@@ -63,9 +64,6 @@ See [Architecture](docs/ARCHITECTURE.md) for the request flow and current limita
 git clone https://github.com/blurry-eyez/open-call.git
 cd open-call
 ```
-
-Replace YOUR_GITHUB_USERNAME with the GitHub
-account or organization that publishes your fork.
 
 ### 3. Configure Cloudflare
 
@@ -111,6 +109,27 @@ Do not expose the Python development server directly to the internet. Put it beh
 
 The [deployment guide](docs/DEPLOYMENT.md) includes a Caddy example, a systemd service example, firewall notes, backups, and a launch checklist.
 
+## Android app
+
+A native Kotlin/Compose client lives in [`android-build/`](android-build/README.md). It uses the same server and
+rooms as the web app, and screen sharing can include the phone's sound (Android 10+).
+
+The app needs only two settings about *your* deployment, and neither is stored in this repository:
+
+| Setting | What it is |
+|---|---|
+| `BASE_URL` | Your Open Call server, e.g. `https://call.example.com` |
+| `GOOGLE_WEB_CLIENT_ID` | The Google OAuth **Web** client ID your server uses |
+
+Your Cloudflare App Secret and TURN token stay on the server; the app never receives them.
+
+**Build your own APK on GitHub:**
+1. Run `bash android-build/make-keystore.sh` once. It creates your signing key and prints its **SHA-1**, which you add to a Google Cloud *Android* OAuth client (package `xyz.s2105.opencall`).
+2. Add the repository secrets `BASE_URL`, `GOOGLE_WEB_CLIENT_ID`, `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`.
+3. Open **Actions → Android release → Run workflow** (you can type the server URL and client ID there), or push a tag such as `android-v1.2`.
+
+The run summary and release notes show the signing SHA-1/SHA-256. Details, local builds and Google Cloud setup: [android-build/README.md](android-build/README.md).
+
 ## Configuration
 
 All settings are read from `.env` or the process environment at startup.
@@ -153,6 +172,7 @@ These paths are ignored by Git. They can contain personal data and must not be c
 - [Architecture and request flow](docs/ARCHITECTURE.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Security and privacy notes](SECURITY.md)
+- [Android app and release builds](android-build/README.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## Contributing
