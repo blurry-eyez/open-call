@@ -1,0 +1,4 @@
+# Copy to local.properties (git-ignored) and fill in.
+sdk.dir=/path/to/Android/Sdk
+BASE_URL=https://your-server.example.com
+GOOGLE_WEB_CLIENT_ID=1234567890-xxxxxxxx.apps.googleusercontent.com

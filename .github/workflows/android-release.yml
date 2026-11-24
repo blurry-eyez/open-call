@@ -1,0 +1,100 @@
+name: Android release
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Your Open Call server URL, e.g. https://call.example.com (blank = BASE_URL secret)"
+        required: false
+      google_web_client_id:
+        description: "Google OAuth WEB client ID (blank = GOOGLE_WEB_CLIENT_ID secret)"
+        required: false
+      tag:
+        description: "Release tag to create, e.g. android-v1.2 (blank = build only, no release)"
+        required: false
+  push:
+    tags: ["android-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android-build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Check settings
+        env:
+          BASE_URL: ${{ inputs.base_url || secrets.BASE_URL }}
+          GID: ${{ inputs.google_web_client_id || secrets.GOOGLE_WEB_CLIENT_ID }}
+        run: |
+          [ -n "$BASE_URL" ] && [[ "$BASE_URL" == https://* ]] || { echo "::error::Set BASE_URL (https://...) as a secret or workflow input"; exit 1; }
+          [ -n "$GID" ] && [[ "$GID" == *.apps.googleusercontent.com ]] || { echo "::error::Set GOOGLE_WEB_CLIENT_ID (…apps.googleusercontent.com) as a secret or workflow input"; exit 1; }
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "TEMP_KEY=false" >> "$GITHUB_ENV"
+          else
+            # No keystore secret: make a throw-away key so the build still works.
+            KEYSTORE_PASSWORD=$(openssl rand -hex 12); KEY_PASSWORD=$KEYSTORE_PASSWORD; KEY_ALIAS=temp
+            keytool -genkeypair -keystore "$RUNNER_TEMP/release.jks" -alias temp -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" -dname "CN=Open Call temp"
+            echo "TEMP_KEY=true" >> "$GITHUB_ENV"
+          fi
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        env:
+          BASE_URL: ${{ inputs.base_url || secrets.BASE_URL }}
+          GOOGLE_WEB_CLIENT_ID: ${{ inputs.google_web_client_id || secrets.GOOGLE_WEB_CLIENT_ID }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/*.apk OpenCall.apk
+
+      - name: Signing certificate (SHA-1 for Google Cloud)
+        run: |
+          SHA=$(keytool -list -v -keystore "$KEYSTORE_PATH" -alias "$KEY_ALIAS" -storepass "$KEYSTORE_PASSWORD" | grep -E "SHA1:|SHA256:")
+          {
+            echo "### APK signing certificate"
+            echo '```'
+            echo "$SHA"
+            echo '```'
+            echo "Add the **SHA1** above to your Google Cloud **Android** OAuth client (package \`xyz.s2105.opencall\`)."
+            if [ "$TEMP_KEY" = "true" ]; then
+              echo ""
+              echo "> ⚠️ **Temporary key.** No KEYSTORE_BASE64 secret was set, so this SHA changes every run and updates will not install over older builds. Run \`android-build/make-keystore.sh\` once and add the secrets (see android-build/README.md)."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY" > sha.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCall-apk
+          path: android-build/OpenCall.apk
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" OpenCall.apk --repo "$GITHUB_REPOSITORY" --title "Open Call Android $TAG" --notes-file sha.md \
+            || gh release upload "$TAG" OpenCall.apk --repo "$GITHUB_REPOSITORY" --clobber

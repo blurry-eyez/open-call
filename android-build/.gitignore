@@ -1,0 +1,14 @@
+# local / personal
+local.properties
+client-id.txt
+*.jks
+*.keystore
+keystore.b64
+# build
+.gradle/
+.kotlin/
+build/
+app/build/
+*.apk
+.idea/
+*.zip
